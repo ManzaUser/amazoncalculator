@@ -1,0 +1,1047 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Calculadora de rendimientos para Amazon</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0b1120; }
+    select option { background: #060e1f; color: #e2e8f0; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0d1829; }
+    ::-webkit-scrollbar-thumb { background: #1e3a5f; border-radius: 3px; }
+    input[type=number]::-webkit-inner-spin-button { opacity: 0.5; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+  (function() {
+    var noop = function() {};
+    console.log   = noop;
+    console.warn  = noop;
+    console.error = noop;
+    console.info  = noop;
+    console.debug = noop;
+  })();
+</script>
+<script type="text/babel">
+const { useState, useRef, useCallback, useMemo } = React;
+const XLSX = window.XLSX;
+const Papa = window.Papa;
+
+// ─── Parse TARIFF (standard sheet_to_json, row 1 = headers) ──────────────────
+function parseTariffFile(file, hdrRow) {
+  if (!hdrRow) hdrRow = 1;
+  return new Promise(function(res, rej) {
+    var name = file.name.toLowerCase();
+    if (name.endsWith(".csv") || name.endsWith(".txt")) {
+      var r = new FileReader();
+      r.onload = function(e) {
+        try {
+          var result = hdrRow <= 1
+            ? Papa.parse(e.target.result, { header: true, skipEmptyLines: true, dynamicTyping: false })
+            : (function() { var r = Papa.parse(e.target.result, { header: false, skipEmptyLines: true }); var rows = r.data; var hdrs = rows[hdrRow-1] || []; var data = rows.slice(hdrRow).map(function(row) { var obj = {}; hdrs.forEach(function(h,i){ obj[String(h).trim()] = row[i] || ""; }); return obj; }); return { data: data }; })();
+          if (!result.data || result.data.length === 0) { rej(new Error("El CSV esta vacio.")); return; }
+          var cleaned = result.data.map(function(row) {
+            var out = {};
+            Object.keys(row).forEach(function(k) { if (k && !k.startsWith("__EMPTY")) out[k.trim()] = row[k]; });
+            return out;
+          });
+          res(cleaned);
+        } catch(err) { rej(err); }
+      };
+      r.onerror = function() { rej(new Error("Error leyendo " + file.name)); };
+      r.readAsText(file, "UTF-8");
+    } else {
+      var r2 = new FileReader();
+      r2.onload = function(e) {
+        try {
+          var wb = XLSX.read(e.target.result, { type: "array" });
+          var ws = wb.Sheets[wb.SheetNames[0]];
+          if (!ws || !ws["!ref"]) { rej(new Error("Hoja vacia en " + file.name)); return; }
+          var raw = XLSX.utils.sheet_to_json(ws, { defval: "", range: hdrRow - 1 });
+          if (raw.length === 0) {
+            var rng = XLSX.utils.decode_range(ws["!ref"]);
+            rej(new Error("Sin datos. Rango: " + ws["!ref"] + " (" + (rng.e.r + 1) + " filas). Asegurate de que la cabecera este en fila 1.")); return;
+          }
+          var cleaned2 = raw.map(function(row) {
+            var out = {};
+            Object.keys(row).forEach(function(k) { if (k && !k.startsWith("__EMPTY")) out[k.trim()] = row[k]; });
+            return out;
+          });
+          res(cleaned2);
+        } catch(err) { rej(err); }
+      };
+      r2.onerror = function() { rej(new Error("Error leyendo " + file.name)); };
+      r2.readAsArrayBuffer(file);
+    }
+  });
+}
+
+// ─── Parse AMAZON (cell-by-cell, stores by header name AND _col_X) ────────────
+function parseAmazonFile(file, headerRow) {
+  return new Promise(function(res, rej) {
+    var name = file.name.toLowerCase();
+    var hIdx = headerRow - 1;
+
+    function buildRows(rawRows) {
+      if (rawRows.length <= hIdx) return [];
+      var headers = rawRows[hIdx].map(function(h) { return String(h != null ? h : "").trim(); });
+      var data = [];
+      for (var r = hIdx + 1; r < rawRows.length; r++) {
+        var row = {}; var hasData = false;
+        for (var ci = 0; ci < rawRows[r].length; ci++) {
+          var val    = rawRows[r][ci] != null ? rawRows[r][ci] : "";
+          var colKey = "_col_" + XLSX.utils.encode_col(ci);
+          var hName  = headers[ci] || "";
+          row[colKey] = val;
+          if (hName) row[hName] = val;
+          if (String(val).trim() !== "") hasData = true;
+        }
+        if (hasData) data.push(row);
+      }
+      return data;
+    }
+
+    function parseAsText(text) {
+      // Try tab-separated first, then comma
+      var sep = text.indexOf("\t") > -1 ? "\t" : ",";
+      var result = Papa.parse(text, { header: false, skipEmptyLines: true, delimiter: sep });
+      return buildRows(result.data);
+    }
+
+    function tryXLSX(buffer) {
+      try {
+        // Suppress XLSX console noise during parse
+        var _origError = console.error;
+        var _origWarn  = console.warn;
+        console.error = function() {};
+        console.warn  = function() {};
+        var wb;
+        try {
+          wb = XLSX.read(buffer, { type: "array", WTF: false, cellNF: false, cellStyles: false, cellDates: false });
+        } finally {
+          console.error = _origError;
+          console.warn  = _origWarn;
+        }
+        var ws = wb.Sheets[wb.SheetNames[0]];
+        if (!ws || !ws["!ref"]) return null;
+        var range = XLSX.utils.decode_range(ws["!ref"] || "A1");
+        var rawRows = [];
+        for (var ri = range.s.r; ri <= range.e.r; ri++) {
+          var row2 = [];
+          for (var ci = range.s.c; ci <= range.e.c; ci++) {
+            var cell = ws[XLSX.utils.encode_cell({ r: ri, c: ci })];
+            row2.push(cell != null ? (cell.w || String(cell.v != null ? cell.v : "")) : "");
+          }
+          rawRows.push(row2);
+        }
+        return buildRows(rawRows);
+      } catch(e) { return null; }
+    }
+
+    if (name.endsWith(".csv") || name.endsWith(".txt")) {
+      var r = new FileReader();
+      r.onload = function(e) {
+        try { res(parseAsText(e.target.result)); }
+        catch(err) { rej(err); }
+      };
+      r.onerror = function() { rej(new Error("Error leyendo " + file.name)); };
+      r.readAsText(file, "UTF-8");
+    } else {
+      // Try as binary Excel first, fall back to reading as text (some Amazon exports are TSV with .xlsx extension)
+      var r2 = new FileReader();
+      r2.onload = function(e) {
+        var xlsxResult = tryXLSX(e.target.result);
+        if (xlsxResult && xlsxResult.length > 0) {
+          res(xlsxResult);
+        } else {
+          // Fallback: read as text (handles TSV/CSV disguised as xlsx)
+          var r3 = new FileReader();
+          r3.onload = function(e2) {
+            try { res(parseAsText(e2.target.result)); }
+            catch(err) { rej(new Error("No se pudo leer el archivo. Prueba a exportarlo como CSV desde Excel.")); }
+          };
+          r3.onerror = function() { rej(new Error("Error leyendo " + file.name)); };
+          r3.readAsText(file, "UTF-8");
+        }
+      };
+      r2.onerror = function() { rej(new Error("Error leyendo " + file.name)); };
+      r2.readAsArrayBuffer(file);
+    }
+  });
+}
+
+// ─── Auto-detect helpers ──────────────────────────────────────────────────────
+function detectTariffCols(headers) {
+  function find(pats) {
+    for (var i = 0; i < headers.length; i++) {
+      for (var j = 0; j < pats.length; j++) {
+        if (pats[j].test(String(headers[i]).trim())) return headers[i];
+      }
+    }
+    return null;
+  }
+  return {
+    sku:   find([/^sku$/i, /^ref/i, /^cod/i, /^referencia/i, /^codigo/i, /^articulo/i]),
+    model: find([/descrip/i, /nombre/i, /product/i, /modelo/i, /articulo/i]),
+    price: find([/coste.euros/i, /coste.eur/i, /coste.unit/i, /precio.unit/i, /p\.unit/i, /^precio$/i, /^coste$/i, /^cost$/i, /^pvp$/i, /unit.price/i, /^price$/i]),
+    curr:  find([/moneda/i, /currency/i, /divisa/i]),
+  };
+}
+
+function detectAmazonCols(headers) {
+  function find(pats) {
+    for (var i = 0; i < headers.length; i++) {
+      if (/^_col_/.test(headers[i])) continue;
+      for (var j = 0; j < pats.length; j++) {
+        if (pats[j].test(String(headers[i]))) return headers[i];
+      }
+    }
+    return null;
+  }
+  return {
+    sku:     find([/^sku$/i, /seller.?sku/i]),
+    asin:    find([/^asin$/i]),
+    product: find([/^title$/i, /^titulo$/i, /product.?name/i, /nombre.?del.?producto/i, /^nombre/i, /descripci/i]),
+  };
+}
+
+// ─── Number helpers ───────────────────────────────────────────────────────────
+function toNum(v) {
+  if (v == null || v === "") return 0;
+  if (typeof v === "number") return v;
+  var s = String(v).trim().replace(/[€$£%\s]/g, "");
+  if (/\.\d{3}(,|$)/.test(s) || (s.indexOf(",") > -1 && s.indexOf(".") > -1)) {
+    s = s.replace(/\./g, "").replace(",", ".");
+  } else {
+    s = s.replace(",", ".");
+  }
+  var n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+
+function toPct(v) {
+  if (v == null || v === "") return null;
+  var s = String(v).trim();
+  var n = parseFloat(s.replace("%", "").replace(",", "."));
+  if (isNaN(n)) return null;
+  return s.indexOf("%") > -1 ? n / 100 : n;
+}
+
+function normSKU(s) {
+  return String(s != null ? s : "").trim().toUpperCase().replace(/\s+/g, " ");
+}
+
+// ─── Formatters ───────────────────────────────────────────────────────────────
+function n2(v, d) {
+  if (d === undefined) d = 2;
+  if (v == null) return "-";
+  return Number(v).toLocaleString("es-ES", { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+function fEUR(v) { return v == null ? "-" : "\u20ac" + n2(v); }
+function fUSD(v) { return v == null ? "-" : "$" + n2(v); }
+function fPct(v) { return v == null ? "-" : n2(v * 100, 1) + "%"; }
+function bCol(v) { return v == null ? "#334155" : v >= 0 ? "#4ade80" : "#f87171"; }
+
+// ─── Styles ───────────────────────────────────────────────────────────────────
+var S = {
+  wrap: { minHeight: "100vh", background: "#0b1120", color: "#e2e8f0", fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" },
+  page: { maxWidth: 1400, margin: "0 auto", padding: "24px 16px 80px" },
+  card: { background: "#0d1829", border: "1px solid #1e2d4a", borderRadius: 14, padding: 20 },
+  sel:  { background: "#060e1f", border: "1px solid #1e3a5f", borderRadius: 10, padding: "8px 12px", color: "#e2e8f0", fontSize: 13, outline: "none", width: "100%" },
+  btnP: { background: "#1d4ed8", color: "#fff", border: "none", borderRadius: 10, padding: "10px 28px", fontWeight: 700, fontSize: 14, cursor: "pointer" },
+  btnS: { background: "#0f1929", color: "#94a3b8", border: "1px solid #1e3a5f", borderRadius: 10, padding: "8px 16px", fontSize: 13, cursor: "pointer" },
+  thR:  { padding: "10px 12px", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: ".05em", textAlign: "right",  borderBottom: "1px solid #1e2d4a", color: "#475569", whiteSpace: "nowrap", cursor: "pointer", background: "#0a1525", position: "sticky", top: 0, zIndex: 2 },
+  thL:  { padding: "10px 12px", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: ".05em", textAlign: "left",   borderBottom: "1px solid #1e2d4a", color: "#475569", whiteSpace: "nowrap", cursor: "pointer", background: "#0a1525", position: "sticky", top: 0, zIndex: 2 },
+  thC:  { padding: "10px 12px", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: ".05em", textAlign: "center", borderBottom: "1px solid #1e2d4a", color: "#475569", whiteSpace: "nowrap", background: "#0a1525", position: "sticky", top: 0, zIndex: 2 },
+  tdR:  { padding: "9px 12px", fontSize: 13, textAlign: "right",  borderBottom: "1px solid #0a1020" },
+  tdL:  { padding: "9px 12px", fontSize: 13, textAlign: "left",   borderBottom: "1px solid #0a1020" },
+  tdC:  { padding: "9px 12px", fontSize: 13, textAlign: "center", borderBottom: "1px solid #0a1020" },
+};
+
+// ─── DropFile ─────────────────────────────────────────────────────────────────
+function DropFile(props) {
+  var isDragState = useState(false);
+  var isDrag = isDragState[0], setDrag = isDragState[1];
+  var ref = useRef(null);
+  return (
+    <div
+      onDragOver={function(e) { e.preventDefault(); setDrag(true); }}
+      onDragLeave={function() { setDrag(false); }}
+      onDrop={function(e) { e.preventDefault(); setDrag(false); var f = e.dataTransfer.files[0]; if (f) props.onFile(f); }}
+      onClick={function() { if (ref.current) ref.current.click(); }}
+      style={{ border: "2px dashed " + (isDrag ? props.color : props.file ? props.color + "99" : "#1e3a5f"), background: props.file ? props.color + "12" : "#0d1829", borderRadius: 14, padding: 22, textAlign: "center", cursor: "pointer" }}
+    >
+      <input ref={ref} type="file" accept={props.accept} style={{ display: "none" }} onChange={function(e) { if (e.target.files[0]) props.onFile(e.target.files[0]); }} />
+      <div style={{ fontSize: 28, marginBottom: 8 }}>{props.icon}</div>
+      <div style={{ fontWeight: 700, color: "#e2e8f0", fontSize: 14 }}>{props.label}</div>
+      <div style={{ fontSize: 12, color: "#475569", marginTop: 4 }}>{props.desc}</div>
+      {props.file
+        ? <div style={{ fontSize: 12, color: props.color, marginTop: 10, fontWeight: 600 }}>{"✓ " + props.file.name}</div>
+        : <div style={{ fontSize: 11, color: "#334155", marginTop: 10, border: "1px solid #1e3a5f", borderRadius: 6, padding: "3px 12px", display: "inline-block" }}>Arrastra o haz clic</div>}
+    </div>
+  );
+}
+
+// ─── ColPick ──────────────────────────────────────────────────────────────────
+function ColPick(props) {
+  var nameHeaders = props.headers.filter(function(h) { return !String(h).startsWith("_col_"); });
+  var preview = null;
+  if (props.value && props.data && props.data.length > 0) {
+    preview = props.data.slice(0, 3).map(function(r) { return String(r[props.value] != null ? r[props.value] : ""); }).filter(Boolean).join("  ·  ");
+  }
+  return (
+    <div>
+      <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 5, fontWeight: 600 }}>
+        {props.label}{props.required !== false && <span style={{ color: "#f87171", marginLeft: 4 }}>*</span>}
+      </div>
+      <select value={props.value || ""} onChange={function(e) { props.onChange(e.target.value || null); }} style={S.sel}>
+        <option value="">— no usar —</option>
+        {nameHeaders.map(function(h) { return <option key={h} value={h}>{h}</option>; })}
+      </select>
+      {preview && <div style={{ fontSize: 11, color: "#4ade80", marginTop: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{"ej: " + preview}</div>}
+    </div>
+  );
+}
+
+// ─── ColLetter ────────────────────────────────────────────────────────────────
+function ColLetter(props) {
+  var col    = "_col_" + String(props.value || "").toUpperCase();
+  var exists = props.value && props.data && props.data.length > 0 && props.data[0][col] !== undefined;
+  var preview = exists ? props.data.slice(0, 2).map(function(r) { var v = r[col]; return v != null && v !== "" ? String(v).slice(0, 20) : null; }).filter(Boolean).join("  ·  ") : null;
+  return (
+    <div>
+      <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 5, fontWeight: 600 }}>{props.label}</div>
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <input value={props.value} onChange={function(e) { props.onChange(e.target.value.toUpperCase()); }}
+          style={{ background: "#060e1f", border: "1px solid #1e3a5f", borderRadius: 10, padding: "6px 8px", color: "#e2e8f0", fontSize: 14, fontWeight: 700, fontFamily: "monospace", outline: "none", width: 56, textAlign: "center" }}
+          placeholder="A" />
+        {props.hint && <span style={{ fontSize: 11, color: "#334155" }}>{props.hint}</span>}
+      </div>
+      {props.value && (exists
+        ? <div style={{ fontSize: 11, color: "#4ade80", marginTop: 3 }}>{"✓ " + (preview || "(vacia)")}</div>
+        : <div style={{ fontSize: 11, color: "#f87171", marginTop: 3 }}>Columna no encontrada</div>)}
+    </div>
+  );
+}
+
+// ─── SortTh ───────────────────────────────────────────────────────────────────
+function SortTh(props) {
+  var active = props.sortBy === props.col;
+  var base   = props.left ? S.thL : S.thR;
+  return (
+    <th onClick={function() { props.onSort(props.col); }} style={Object.assign({}, base, { color: active ? "#60a5fa" : "#475569" })}>
+      {props.label + (active ? (props.sortDir === "asc" ? " ↑" : " ↓") : " ↕")}
+    </th>
+  );
+}
+
+// ─── App ──────────────────────────────────────────────────────────────────────
+function App() {
+  var s1 = useState("upload");      var step = s1[0], setStep = s1[1];
+  var s2 = useState(null);          var tariffFile = s2[0], setTariffFile = s2[1];
+  var s3 = useState(null);          var amazonFile = s3[0], setAmazonFile = s3[1];
+  var s4 = useState([]);            var tariffData = s4[0], setTariffData = s4[1];
+  var s5 = useState([]);            var amazonData = s5[0], setAmazonData = s5[1];
+  var s6 = useState(2);             var amazonHdrRow = s6[0], setAmazonHdrRow = s6[1];
+  var s23 = useState(1);             var tariffHdrRow = s23[0], setTariffHdrRow = s23[1];
+  var s7 = useState(false);         var parsing = s7[0], setParsing = s7[1];
+  var s8 = useState(null);          var fileErr = s8[0], setFileErr = s8[1];
+  var s9 = useState({ sku: null, model: null, price: null, curr: null });
+  var tMap = s9[0], setTMap = s9[1];
+  var s10 = useState({ sku: null, asin: null, product: null, colF: "F", colG: "G", colP: "P", colQ: "Q", colS: "S", colNC: "NC", colNI: "NI", colNF: "NF", colIO: "IO", colO: "O", colFN: "FN", colHB: "HB", colAZ: "AZ", colAR: "AR", colDY: "DY", colHS: "HS" });
+  var aMap = s10[0], setAMap = s10[1];
+  var _savedRate = (function() { try { var v = parseFloat(localStorage.getItem("eurUsd")); return v > 0 ? v : 1.085; } catch(e) { return 1.085; } })();
+  var s11 = useState({ eurUsd: _savedRate, reportDays: 30, shippingTotal: 0, shippingCurrency: "EUR" });
+  var config = s11[0], setConfig = s11[1];
+  var s12 = useState(null);         var rows = s12[0], setRows = s12[1];
+  var s13 = useState(null);         var matchInfo = s13[0], setMatchInfo = s13[1];
+  var s15 = useState("");           var search = s15[0], setSearch = s15[1];
+  var s20 = useState(false);          var hideNoCost = s20[0], setHideNoCost = s20[1];
+  var s21 = useState(30);             var targetMargin = s21[0], setTargetMargin = s21[1];
+  var s25 = useState("");              var rateStatus = s25[0], setRateStatus = s25[1];
+  var s22 = useState(true);            var showMatchWarning = s22[0], setShowMatchWarning = s22[1];
+  var s26 = useState(false);           var showConfig = s26[0], setShowConfig = s26[1];
+  var s24 = useState(false);           var hideNoSales = s24[0], setHideNoSales = s24[1];
+  var s19 = useState({});           var colFilters = s19[0], setColFilters = s19[1];
+  var s16 = useState("ingresosNetos"); var sortC = s16[0], setSortC = s16[1];
+  var s17 = useState("desc");       var sortD = s17[0], setSortD = s17[1];
+
+  var tariffHeaders = tariffData.length > 0 ? Object.keys(tariffData[0]) : [];
+  var amazonHeaders = amazonData.length > 0 ? Object.keys(amazonData[0]) : [];
+
+  function loadTariff(file, overrideRow) {
+    setFileErr(null); setParsing(true);
+    var row = overrideRow != null ? overrideRow : tariffHdrRow;
+    parseTariffFile(file, row).then(function(data) {
+      setTariffFile(file); setTariffData(data);
+      setTMap(detectTariffCols(Object.keys(data[0])));
+      setParsing(false);
+    }).catch(function(e) { setFileErr("Tarifa: " + e.message); setParsing(false); });
+  }
+
+  function loadAmazon(file, overrideRow) {
+    setFileErr(null); setParsing(true);
+    var row = overrideRow != null ? overrideRow : amazonHdrRow;
+    parseAmazonFile(file, row).then(function(data) {
+      if (!data || data.length === 0) { setFileErr("Amazon: informe vacio con esa fila de cabecera."); setParsing(false); return; }
+      setAmazonFile(file); setAmazonData(data);
+      var detected = detectAmazonCols(Object.keys(data[0]));
+      setAMap(function(m) { return Object.assign({}, m, detected); });
+      setParsing(false);
+    }).catch(function(e) { setFileErr("Amazon: " + e.message); setParsing(false); });
+  }
+
+  function fetchRate() {
+    setRateStatus("cargando");
+    function applyRate(rate) {
+      var r = parseFloat(rate.toFixed(4));
+      setConfig(function(prev) { return Object.assign({}, prev, { eurUsd: r }); });
+      setRateStatus("ok:" + r);
+      try { localStorage.setItem("eurUsd", r); } catch(e) {}
+    }
+    function trySource1() {
+      // jsDelivr CDN - works from file:// and any origin
+      return fetch("https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/eur.json")
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          if (d.eur && d.eur.usd) { applyRate(d.eur.usd); return true; }
+          throw new Error("no data");
+        });
+    }
+    function trySource2() {
+      return fetch("https://api.frankfurter.app/latest?from=EUR&to=USD")
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          if (d.rates && d.rates.USD) { applyRate(d.rates.USD); return true; }
+          throw new Error("no data");
+        });
+    }
+    function trySource3() {
+      return fetch("https://open.er-api.com/v6/latest/EUR")
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          if (d.rates && d.rates.USD) { applyRate(d.rates.USD); return true; }
+          throw new Error("no data");
+        });
+    }
+    trySource1()
+      .catch(function() { return trySource2(); })
+      .catch(function() { return trySource3(); })
+      .catch(function() { setRateStatus("error"); });
+  }
+
+  function calculate() {
+    setFileErr(null);
+    if (!amazonData.length) { setFileErr("Sube el informe de Amazon primero."); return; }
+    var tariffLookup = {};
+    var tariffSkuList = [];
+    for (var ti = 0; ti < tariffData.length; ti++) {
+      var trow = tariffData[ti];
+      var tsku = tMap.sku ? normSKU(trow[tMap.sku]) : "";
+      var tmod = tMap.model ? String(trow[tMap.model] != null ? trow[tMap.model] : "").trim().toLowerCase() : "";
+      var tprice = toNum(tMap.price ? trow[tMap.price] : 0);
+      var tcurr = tMap.curr ? String(trow[tMap.curr] != null ? trow[tMap.curr] : "EUR").trim().toUpperCase() : "EUR";
+      var tpriceEUR = tcurr === "USD" ? tprice / config.eurUsd : tprice;
+      if (tsku) { tariffLookup[tsku] = tpriceEUR; tariffSkuList.push(tsku); }
+      if (tmod) tariffLookup[tmod] = tpriceEUR;
+    }
+    var totalUnits = 0;
+    for (var ai = 0; ai < amazonData.length; ai++) { totalUnits += toNum(amazonData[ai]["_col_" + aMap.colP]); }
+    var shipUSD = config.shippingCurrency === "EUR" ? config.shippingTotal * config.eurUsd : config.shippingTotal;
+    var result = [];
+    for (var ai2 = 0; ai2 < amazonData.length; ai2++) {
+      var row = amazonData[ai2];
+      function gc(k) { return row["_col_" + k]; }
+      var rawSku = aMap.sku ? row[aMap.sku] : "";
+      var asin = aMap.asin ? String(row[aMap.asin] != null ? row[aMap.asin] : "").trim() : "";
+      var sku = normSKU(rawSku);
+      var producto = aMap.product ? String(row[aMap.product] != null ? row[aMap.product] : "").trim() : "";
+      var skuShort = sku.split("-").slice(0, -1).join("-");
+      var costeEUR = tariffLookup[sku] != null ? tariffLookup[sku] : (tariffLookup[skuShort] != null ? tariffLookup[skuShort] : (tariffLookup[producto.toLowerCase()] != null ? tariffLookup[producto.toLowerCase()] : null));
+      var costeUSD = costeEUR != null ? costeEUR * config.eurUsd : null;
+      var unidsVendidas = toNum(gc(aMap.colP));
+      var shippingCost = totalUnits > 0 ? (unidsVendidas / totalUnits) * shipUSD : 0;
+      var publicidad = toNum(gc(aMap.colNC)) + toNum(gc(aMap.colNI));
+      var ingresosNetos = toNum(gc(aMap.colF));
+      var beneficioUSD = ingresosNetos - (costeUSD != null ? costeUSD : 0) - publicidad - shippingCost;
+      var beneficioEUR = beneficioUSD / config.eurUsd;
+      var pctBeneficio = ingresosNetos !== 0 ? (beneficioUSD / ingresosNetos) * 100 : null;
+      if (unidsVendidas > 0 || ingresosNetos > 0) {
+        var acos = toPct(gc(aMap.colNF));
+        var comision = toNum(gc(aMap.colFN)) + toNum(gc(aMap.colHB));
+        var dias365 = (gc(aMap.colIO) != null && String(gc(aMap.colIO)).trim() !== "") ? "SI" : "No";
+        var gastosFBA = toNum(gc(aMap.colAZ)) + toNum(gc(aMap.colAR)) + toNum(gc(aMap.colDY)) + toNum(gc(aMap.colHS));
+        var pvp = toNum(gc(aMap.colO));
+        var precioUnidad = toNum(gc(aMap.colG));
+        var beneficio = costeEUR != null ? (precioUnidad - (costeEUR * config.eurUsd)) : null;
+        var beneficioPct = (beneficio != null && pvp !== 0) ? (beneficio / pvp) * 100 : null;
+        var precioSugerido = null; // computed dynamically from targetMargin
+        result.push({ sku: sku, asin: asin, producto: producto, costeEUR: costeEUR, costeUSD: costeUSD, pvp: pvp, precioUnidad: precioUnidad, unidadesVendidas: unidsVendidas, devolucion: toNum(gc(aMap.colQ)), ratioDevoluciones: toPct(gc(aMap.colS)), publicidad: publicidad, ingresosNetos: ingresosNetos, shippingCost: shippingCost, beneficioUSD: beneficioUSD, beneficioEUR: beneficioEUR, pctBeneficio: pctBeneficio, acos: acos, beneficio: beneficio, beneficioPct: beneficioPct, precioSugerido: precioSugerido, comision: comision, dias365: dias365, gastosFBA: gastosFBA, hasTariff: costeEUR != null });
+      }
+    }
+    var matched = result.filter(function(r) { return r.hasTariff; }).length;
+    var amzSkus = result.map(function(r) { return r.sku; }).filter(Boolean).slice(0, 8);
+    var unmatch = result.filter(function(r) { return !r.hasTariff; }).map(function(r) { return r.sku || r.producto; }).slice(0, 8);
+    setShowMatchWarning(true);
+    setMatchInfo({ matched: matched, total: result.length, amzSkus: amzSkus, tarSkus: tariffSkuList.slice(0, 8), unmatched: unmatch });
+    setRows(result); setStep("results");
+  }
+
+  function doSort(col) {
+    if (sortC === col) setSortD(function(d) { return d === "asc" ? "desc" : "asc"; });
+    else { setSortC(col); setSortD("desc"); }
+  }
+
+  var sorted = useMemo(function() {
+    if (!rows) return [];
+    var r = rows.slice();
+    if (search) { var q = search.toLowerCase(); r = r.filter(function(x) { return x.sku.toLowerCase().indexOf(q) > -1 || x.producto.toLowerCase().indexOf(q) > -1 || (x.asin && x.asin.toLowerCase().indexOf(q) > -1); }); }
+    if (hideNoSales) { r = r.filter(function(x) { return x.unidadesVendidas > 0; }); }
+    if (hideNoCost) { r = r.filter(function(x) { return x.costeEUR != null; }); }
+    // Column filters
+    var filterKeys = Object.keys(colFilters);
+    for (var fi = 0; fi < filterKeys.length; fi++) {
+      var fk = filterKeys[fi]; var fv = colFilters[fk];
+      if (!fv || !fv.trim()) continue;
+      var fvLow = fv.toLowerCase().trim();
+      r = r.filter(function(row) {
+        var val = row[fk];
+        if (val == null) return false;
+        return String(val).toLowerCase().indexOf(fvLow) > -1;
+      });
+    }
+    r.sort(function(a, b) { var av = a[sortC] != null ? a[sortC] : 0; var bv = b[sortC] != null ? b[sortC] : 0; return sortD === "asc" ? av - bv : bv - av; });
+    return r;
+  }, [rows, search, colFilters, hideNoCost, hideNoSales, sortC, sortD]);
+  function sumF(k) { return sorted.reduce(function(s, r) { return s + (r[k] || 0); }, 0); }
+
+  var STEPS = ["upload", "results"];
+  var inp = { background: "#060e1f", border: "1px solid #1e3a5f", borderRadius: 10, padding: "8px 14px", color: "#e2e8f0", fontSize: 14, outline: "none" };
+
+  function calcPVPR(row) {
+    if (row.costeUSD == null) return null;
+    var divisor = 1 - 0.15 - (targetMargin / 100);
+    if (divisor <= 0) return null;
+    return (row.costeUSD + row.gastosFBA + row.publicidad) / divisor;
+  }
+
+  function exportNoCost() {
+    if (!rows) return;
+    var noCost = rows.filter(function(r) { return !r.hasTariff; });
+    if (noCost.length === 0) return;
+    var headers = ["SKU", "ASIN", "Producto", "Ventas", "PVP", "Neto", "ACoS"];
+    var data = noCost.map(function(r) {
+      return [r.sku || "", r.producto || "", r.unidadesVendidas || 0, r.pvp || 0, r.precioUnidad || 0, r.acos != null ? r.acos * 100 : ""];
+    });
+    var ws = XLSX.utils.aoa_to_sheet([headers].concat(data));
+    ws["!cols"] = [14, 32, 10, 12, 12, 10].map(function(w) { return { wch: w }; });
+    var wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Sin coste");
+    XLSX.writeFile(wb, "referencias-sin-coste.xlsx");
+  }
+
+  function exportToExcel() {
+    var headers = ["SKU", "Producto", "Coste EUR", "Coste USD", "Neto", "Ventas", "Devolucion", "Ratio Dev", "Gastos FBA", "Publicidad", "Comision", "ACoS", "Beneficio", "Beneficio %", "PVPR", "+ 365 dias", "Total"];
+    var data = sorted.map(function(r) {
+      return [
+        r.sku || "",
+        r.asin || "",
+        r.producto || "",
+        r.costeEUR != null ? r.costeEUR : "",
+        r.costeUSD != null ? r.costeUSD : "",
+        r.precioUnidad || 0,
+        r.unidadesVendidas || 0,
+        r.devolucion || 0,
+        r.ratioDevoluciones != null ? r.ratioDevoluciones * 100 : "",
+        r.gastosFBA || 0,
+        r.publicidad || 0,
+        r.comision || 0,
+        r.acos != null ? r.acos * 100 : "",
+        r.beneficio != null ? r.beneficio : "",
+        r.beneficioPct != null ? r.beneficioPct : "",
+        (function() { var p = calcPVPR(r); return p != null ? p : ""; })(),
+        r.dias365 || "",
+        r.ingresosNetos || 0
+      ];
+    });
+    var ws = XLSX.utils.aoa_to_sheet([headers].concat(data));
+    // Column widths
+    ws["!cols"] = [12,14,30,12,12,10,12,12,12,12,12,10,12,12,12,12].map(function(w) { return { wch: w }; });
+    // Style header row bold (basic)
+    var wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Knife Report");
+    XLSX.writeFile(wb, "knife-report.xlsx");
+  }
+
+  return (
+    <div style={S.wrap}>
+      <div style={S.page}>
+
+        {/* Header */}
+        <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 32 }}>
+          <div style={{ width: 46, height: 46, background: "linear-gradient(135deg,#1d4ed8,#7c3aed)", borderRadius: 12, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22 }}>🗡️</div>
+          <div>
+            <h1 style={{ fontSize: 20, fontWeight: 800, color: "#f1f5f9", margin: 0 }}>Calculadora de rendimientos para Amazon</h1>
+            <p style={{ fontSize: 12, color: "#475569", margin: 0 }}>Sin API · Calculo local · Por Manza</p>
+          </div>
+          <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6 }}>
+            {STEPS.map(function(s, i) {
+              var active = step === s; var done = STEPS.indexOf(step) > i;
+              var canNav = (s === "upload") || (s === "results" && rows != null);
+              return (
+                <div key={s} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <div
+                    onClick={function() { if (canNav) setStep(s); }}
+                    style={{ background: active ? "#1d4ed8" : done ? "#1e3a5f" : "#060e1f", color: active ? "#fff" : done ? "#94a3b8" : "#334155", border: "1px solid " + (active ? "#1d4ed8" : "#1e3a5f"), borderRadius: 20, padding: "5px 14px", fontSize: 12, fontWeight: 600, cursor: canNav ? "pointer" : "default", opacity: canNav || active ? 1 : 0.4, transition: "all 0.15s" }}
+                  >
+                    {(i + 1) + " " + ["Archivos", "Informe"][i]}
+                  </div>
+                  {i < 2 && <div style={{ width: 16, height: 1, background: "#1e2d4a" }} />}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+
+
+        {/* UPLOAD */}
+        {step === "upload" && (
+          <div>
+            <h2 style={{ fontSize: 17, fontWeight: 700, color: "#f1f5f9", marginBottom: 20 }}>Sube tus archivos</h2>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 16, marginBottom: 24 }}>
+              <div style={{ background: "#0d1829", border: "1px solid #1e2d4a", borderRadius: 14, padding: 12, display: "flex", flexDirection: "column", gap: 10 }}>
+                <DropFile label="Tarifa Proveedor" icon="📋" desc="Excel con SKU, descripcion y precio" accept=".xlsx,.xls,.csv" file={tariffFile} onFile={loadTariff} color="#1d4ed8" />
+                <div style={{ display: "flex", alignItems: "center", gap: 10, paddingTop: 4 }}>
+                  <span style={{ fontSize: 12, color: "#475569" }}>Cabecera en fila:</span>
+                  <div style={{ display: "flex", borderRadius: 8, overflow: "hidden", border: "1px solid #1e3a5f" }}>
+                    {[1, 2, 3].map(function(n) {
+                      return <button key={n} onClick={function() { setTariffHdrRow(n); if (tariffFile) loadTariff(tariffFile, n); }} style={{ background: tariffHdrRow === n ? "#1d4ed8" : "#0f1929", color: tariffHdrRow === n ? "#fff" : "#475569", border: "none", padding: "5px 14px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>{n}</button>;
+                    })}
+                  </div>
+                  {tariffData.length > 0 && <span style={{ fontSize: 11, color: "#4ade80" }}>{"✓ " + tariffData.length + " filas"}</span>}
+                </div>
+                {tariffData.length > 0 && (
+                  <div style={{ background: "#060e1f", borderRadius: 8, padding: "8px 12px" }}>
+                    <div style={{ fontSize: 11, color: "#475569", fontWeight: 700, marginBottom: 4, textTransform: "uppercase", letterSpacing: ".04em" }}>Columnas detectadas</div>
+                    <div style={{ fontSize: 12, color: "#60a5fa", lineHeight: 1.8, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {Object.keys(tariffData[0]).filter(function(k) { return !k.startsWith("_col_"); }).join("  ·  ")}
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div style={{ background: "#0d1829", border: "1px solid #1e2d4a", borderRadius: 14, padding: 12, display: "flex", flexDirection: "column", gap: 10 }}>
+                <DropFile label="Informe Amazon *" icon="📊" desc="CSV o Excel de Seller Central" accept=".xlsx,.xls,.csv,.txt" file={amazonFile} onFile={loadAmazon} color="#d97706" />
+                <div style={{ display: "flex", alignItems: "center", gap: 10, paddingTop: 4 }}>
+                  <span style={{ fontSize: 12, color: "#475569" }}>Cabecera en fila:</span>
+                  <div style={{ display: "flex", borderRadius: 8, overflow: "hidden", border: "1px solid #1e3a5f" }}>
+                    {[1, 2, 3].map(function(n) {
+                      return <button key={n} onClick={function() { setAmazonHdrRow(n); if (amazonFile) loadAmazon(amazonFile, n); }} style={{ background: amazonHdrRow === n ? "#d97706" : "#0f1929", color: amazonHdrRow === n ? "#fff" : "#475569", border: "none", padding: "5px 14px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>{n}</button>;
+                    })}
+                  </div>
+                  {amazonData.length > 0 && <span style={{ fontSize: 11, color: "#4ade80" }}>{"✓ " + amazonData.length + " filas"}</span>}
+                </div>
+                {amazonData.length > 0 && (
+                  <div style={{ background: "#060e1f", borderRadius: 8, padding: "8px 12px" }}>
+                    <div style={{ fontSize: 11, color: "#475569", fontWeight: 700, marginBottom: 4, textTransform: "uppercase", letterSpacing: ".04em" }}>Columnas detectadas</div>
+                    <div style={{ fontSize: 12, color: "#fbbf24", lineHeight: 1.8, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {Object.keys(amazonData[0]).filter(function(k) { return !k.startsWith("_col_"); }).slice(0, 12).join("  ·  ")}
+                      {Object.keys(amazonData[0]).filter(function(k) { return !k.startsWith("_col_"); }).length > 12 ? "  ·  ..." : ""}
+                    </div>
+                    <div style={{ fontSize: 11, color: "#334155", marginTop: 4 }}>
+                      {Object.keys(amazonData[0]).filter(function(k) { return !k.startsWith("_col_"); }).length + " columnas en total"}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+            <div style={{ background: "#0d1829", border: "1px solid #1e2d4a", borderRadius: 14, padding: 20, marginBottom: 20 }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: "#cbd5e1", marginBottom: 14 }}>Instrucciones de uso</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                <div style={{ display: "flex", gap: 10 }}>
+                  <span style={{ color: "#1d4ed8", fontWeight: 700, fontSize: 16, flexShrink: 0 }}>•</span>
+                  <span style={{ fontSize: 13, color: "#94a3b8", lineHeight: 1.6 }}>
+                    Sube una <strong style={{ color: "#cbd5e1" }}>tarifa de proveedor</strong> con 3 columnas: SKU, Nombre del producto y Coste en euros
+                  </span>
+                </div>
+                <div style={{ display: "flex", gap: 10 }}>
+                  <span style={{ color: "#1d4ed8", fontWeight: 700, fontSize: 16, flexShrink: 0 }}>•</span>
+                  <span style={{ fontSize: 13, color: "#94a3b8", lineHeight: 1.6 }}>
+                    Sube el <strong style={{ color: "#cbd5e1" }}>informe de beneficios de Amazon</strong> que puedes descargar desde Seller Central &gt; Finanzas &gt; Analisis de beneficios
+                  </span>
+                </div>
+                <div style={{ display: "flex", gap: 10 }}>
+                  <span style={{ color: "#f59e0b", fontWeight: 700, fontSize: 16, flexShrink: 0 }}>⚠</span>
+                  <span style={{ fontSize: 13, color: "#fbbf24", lineHeight: 1.6 }}>
+                    Recuerda que los ficheros deben ser formato Excel
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {parsing && <div style={{ fontSize: 13, color: "#60a5fa", marginBottom: 12 }}>Leyendo...</div>}
+            <div style={{ display: "flex", justifyContent: "flex-end" }}>
+              <button onClick={function() { calculate(); }} disabled={!amazonFile || parsing} style={{ background: amazonFile && !parsing ? "#1d4ed8" : "#1e3a5f", color: amazonFile && !parsing ? "#fff" : "#475569", border: "none", borderRadius: 10, padding: "10px 28px", fontWeight: 700, fontSize: 14, cursor: amazonFile && !parsing ? "pointer" : "not-allowed" }}>📊 Generar informe →</button>
+            </div>
+          </div>
+        )}
+
+        {/* CONFIG PANEL */}
+        {showConfig && (
+          <div style={{ position: "fixed", inset: 0, zIndex: 100, display: "flex", justifyContent: "flex-end" }}>
+            <div onClick={function() { setShowConfig(false); }} style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.5)" }} />
+            <div style={{ position: "relative", width: "min(620px, 100vw)", background: "#0a1525", borderLeft: "1px solid #1e2d4a", overflowY: "auto", boxShadow: "-8px 0 32px rgba(0,0,0,0.5)" }}>
+              <div style={{ padding: 24 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
+                  <h2 style={{ fontSize: 17, fontWeight: 700, color: "#f1f5f9", margin: 0 }}>⚙ Configuracion</h2>
+                  <button onClick={function() { setShowConfig(false); }} style={{ background: "#1e3a5f", border: "none", color: "#94a3b8", borderRadius: 8, padding: "6px 14px", fontSize: 13, cursor: "pointer", fontWeight: 600 }}>✕ Cerrar</button>
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+
+                  {tariffData.length > 0 && (
+                    <div style={S.card}>
+                      <div style={{ fontSize: 14, fontWeight: 700, color: "#60a5fa", marginBottom: 16 }}>📋 Tarifa Proveedor</div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                        <ColPick label="SKU / Referencia" value={tMap.sku} headers={tariffHeaders} data={tariffData} onChange={function(v) { setTMap(function(m) { return Object.assign({}, m, { sku: v }); }); }} />
+                        <ColPick label="Nombre / Modelo" value={tMap.model} headers={tariffHeaders} data={tariffData} onChange={function(v) { setTMap(function(m) { return Object.assign({}, m, { model: v }); }); }} required={false} />
+                        <ColPick label="Coste / Precio" value={tMap.price} headers={tariffHeaders} data={tariffData} onChange={function(v) { setTMap(function(m) { return Object.assign({}, m, { price: v }); }); }} />
+                      </div>
+                      {!tMap.price && tariffHeaders.length > 0 && (
+                        <div style={{ marginTop: 14, background: "#1a0a00", border: "1px solid #92400e", borderRadius: 8, padding: "10px 14px", fontSize: 12, color: "#fbbf24" }}>
+                          {"Precio no detectado. Columnas: " + tariffHeaders.filter(function(h) { return !h.startsWith("_col_"); }).join("  ·  ")}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div style={S.card}>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: "#fbbf24", marginBottom: 16 }}>📊 Amazon — SKU, ASIN y Producto</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                      <ColPick label="Columna SKU" value={aMap.sku} headers={amazonHeaders} data={amazonData} onChange={function(v) { setAMap(function(m) { return Object.assign({}, m, { sku: v }); }); }} required={false} />
+                      <ColPick label="Columna ASIN" value={aMap.asin} headers={amazonHeaders} data={amazonData} onChange={function(v) { setAMap(function(m) { return Object.assign({}, m, { asin: v }); }); }} required={false} />
+                      <ColPick label="Columna Nombre Producto" value={aMap.product} headers={amazonHeaders} data={amazonData} onChange={function(v) { setAMap(function(m) { return Object.assign({}, m, { product: v }); }); }} required={false} />
+                    </div>
+                  </div>
+
+                  <div style={S.card}>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: "#fbbf24", marginBottom: 4 }}>📊 Amazon — Columnas por letra</div>
+                    <div style={{ fontSize: 12, color: "#475569", marginBottom: 16 }}>Letra exacta de columna en tu Excel</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+                      <ColLetter label="Total (col F)"          value={aMap.colF}  data={amazonData} onChange={function(v) { setAMap(function(m) { return Object.assign({}, m, { colF: v }); }); }}  hint="col F" />
+                      <ColLetter label="Neto (col G)"           value={aMap.colG}  data={amazonData} onChange={function(v) { setAMap(function(m) { return Object.assign({}, m, { colG: v }); }); }}  hint="col G" />
+                      <ColLetter label="PVP (col O)"            value={aMap.colO}  data={amazonData} onChange={function(v) { setAMap(function(m) { return Object.assign({}, m, { colO: v }); }); }}  hint="col O" />
+                      <ColLetter label="Ventas (col P)"         value={aMap.colP}  data={amazonData} onChange={function(v) { setAMap(function(m) { return Object.assign({}, m, { colP: v }); }); }}  hint="col P" />
+                      <ColLetter label="Devolucion (col Q)"     value={aMap.colQ}  data={amazonData} onChange={function(v) { setAMap(function(m) { return Object.assign({}, m, { colQ: v }); }); }}  hint="col Q" />
+                      <ColLetter label="Ratio dev. (col S)"     value={aMap.colS}  data={amazonData} onChange={function(v) { setAMap(function(m) { return Object.assign({}, m, { colS: v }); }); }}  hint="col S" />
+                      <ColLetter label="Publicidad (col NC)"    value={aMap.colNC} data={amazonData} onChange={function(v) { setAMap(function(m) { return Object.assign({}, m, { colNC: v }); }); }} hint="col NC" />
+                      <ColLetter label="ACoS (col NF)"          value={aMap.colNF} data={amazonData} onChange={function(v) { setAMap(function(m) { return Object.assign({}, m, { colNF: v }); }); }} hint="col NF" />
+                      <ColLetter label="Comision FN (col FN)"   value={aMap.colFN} data={amazonData} onChange={function(v) { setAMap(function(m) { return Object.assign({}, m, { colFN: v }); }); }} hint="col FN" />
+                      <ColLetter label="Comision HB (col HB)"   value={aMap.colHB} data={amazonData} onChange={function(v) { setAMap(function(m) { return Object.assign({}, m, { colHB: v }); }); }} hint="col HB" />
+                      <ColLetter label="FBA AZ (col AZ)"        value={aMap.colAZ} data={amazonData} onChange={function(v) { setAMap(function(m) { return Object.assign({}, m, { colAZ: v }); }); }} hint="col AZ" />
+                      <ColLetter label="FBA AR (col AR)"        value={aMap.colAR} data={amazonData} onChange={function(v) { setAMap(function(m) { return Object.assign({}, m, { colAR: v }); }); }} hint="col AR" />
+                      <ColLetter label="FBA DY (col DY)"        value={aMap.colDY} data={amazonData} onChange={function(v) { setAMap(function(m) { return Object.assign({}, m, { colDY: v }); }); }} hint="col DY" />
+                      <ColLetter label="FBA HS (col HS)"        value={aMap.colHS} data={amazonData} onChange={function(v) { setAMap(function(m) { return Object.assign({}, m, { colHS: v }); }); }} hint="col HS" />
+                      <ColLetter label="+ 365 dias (col IO)"    value={aMap.colIO} data={amazonData} onChange={function(v) { setAMap(function(m) { return Object.assign({}, m, { colIO: v }); }); }} hint="col IO" />
+                    </div>
+                  </div>
+
+                  <div style={S.card}>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: "#cbd5e1", marginBottom: 16 }}>⚙ Parametros</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+                      <div>
+                        <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 6, fontWeight: 600 }}>Tipo de cambio EUR / USD</div>
+                        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                          <input type="number" step="0.001" min="0.5" max="3" value={config.eurUsd} onChange={function(e) { var v = parseFloat(e.target.value) || 1; setConfig(function(prev) { return Object.assign({}, prev, { eurUsd: v }); }); try { localStorage.setItem("eurUsd", v); } catch(ex) {} }} style={Object.assign({}, inp, { width: 110 })} />
+                          <button onClick={fetchRate} style={{ background: rateStatus === "cargando" ? "#1e3a5f" : "#0f1929", color: "#94a3b8", border: "1px solid #1e3a5f", borderRadius: 10, padding: "7px 12px", fontSize: 12, cursor: "pointer" }}>
+                            {rateStatus === "cargando" ? "Cargando..." : "Obtener tipo actual"}
+                          </button>
+                          {rateStatus && rateStatus.indexOf("ok:") === 0 && <span style={{ fontSize: 12, color: "#4ade80" }}>{"✓ " + rateStatus.replace("ok:", "") + " USD"}</span>}
+                          {rateStatus === "error" && <span style={{ fontSize: 12, color: "#f87171" }}>No se pudo obtener.</span>}
+                        </div>
+                        <div style={{ fontSize: 11, color: "#334155", marginTop: 4 }}>{"1 EUR = " + config.eurUsd + " USD"}</div>
+                      </div>
+                      <div>
+                        <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 6, fontWeight: 600 }}>Dias del periodo analizado</div>
+                        <input type="number" step="1" min="1" max="365" value={config.reportDays} onChange={function(e) { setConfig(function(prev) { return Object.assign({}, prev, { reportDays: parseInt(e.target.value) || 30 }); }); }} style={Object.assign({}, inp, { width: 100 })} />
+                      </div>
+                    </div>
+                  </div>
+
+                </div>
+                <div style={{ marginTop: 20, display: "flex", justifyContent: "flex-end" }}>
+                  <button onClick={function() { setShowConfig(false); calculate(); }} style={{ background: "#1d4ed8", color: "#fff", border: "none", borderRadius: 10, padding: "10px 24px", fontWeight: 700, fontSize: 14, cursor: "pointer" }}>✓ Aplicar y recalcular</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+{/* RESULTS */}
+        {step === "results" && rows && (
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 20, flexWrap: "wrap", gap: 12 }}>
+              <div>
+                <h2 style={{ fontSize: 17, fontWeight: 700, color: "#f1f5f9", margin: 0 }}>Informe de Rentabilidad</h2>
+                <p style={{ fontSize: 12, color: "#475569", marginTop: 4 }}>{rows.length + " productos  ·  1 EUR = " + config.eurUsd + " USD  ·  " + config.reportDays + "d"}</p>
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={function() { setShowConfig(true); }} style={S.btnS}>⚙ Configuracion</button>
+                <button onClick={function() { setStep("upload"); setRows(null); setTariffFile(null); setAmazonFile(null); setTariffData([]); setAmazonData([]); }} style={S.btnS}>Nuevo</button>
+                <button onClick={exportToExcel} style={{ background: "#15803d", color: "#fff", border: "none", borderRadius: 10, padding: "8px 16px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>⬇ Exportar Excel</button>
+              </div>
+            </div>
+
+            {matchInfo && matchInfo.matched < matchInfo.total && showMatchWarning && (
+              <div style={{ background: "#1a100a", border: "1px solid #92400e", borderRadius: 12, padding: 16, marginBottom: 16 }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+                  <div style={{ fontWeight: 700, color: "#fbbf24" }}>{"⚠ " + matchInfo.matched + " / " + matchInfo.total + " con coste — " + (matchInfo.total - matchInfo.matched) + " sin match"}</div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button onClick={exportNoCost} style={{ background: "#15803d", color: "#fff", border: "none", borderRadius: 8, padding: "5px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>⬇ Exportar sin coste</button>
+                    <button onClick={function() { setShowMatchWarning(false); }} style={{ background: "none", border: "none", color: "#6b7280", cursor: "pointer", fontSize: 18, lineHeight: 1 }}>x</button>
+                  </div>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+                  <div>
+                    <div style={{ fontSize: 11, color: "#94a3b8", fontWeight: 700, marginBottom: 6, textTransform: "uppercase" }}>SKUs en Tarifa</div>
+                    {matchInfo.tarSkus.map(function(s, i) { return <div key={i} style={{ fontFamily: "monospace", fontSize: 12, color: "#60a5fa", lineHeight: 1.8 }}>{s}</div>; })}
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 11, color: "#94a3b8", fontWeight: 700, marginBottom: 6, textTransform: "uppercase" }}>SKUs en Amazon</div>
+                    {matchInfo.amzSkus.map(function(s, i) { return <div key={i} style={{ fontFamily: "monospace", fontSize: 12, color: matchInfo.tarSkus.indexOf(s) > -1 ? "#4ade80" : "#f87171", lineHeight: 1.8 }}>{s || "(vacio)"}</div>; })}
+                  </div>
+                </div>
+                {matchInfo.unmatched.length > 0 && <div style={{ marginTop: 12, fontSize: 11, color: "#f87171" }}>{"Sin coste: " + matchInfo.unmatched.join("  ·  ")}</div>}
+              </div>
+            )}
+
+            <div style={{ background: "#0d1829", border: "1px solid #1e2d4a", borderRadius: 14, padding: 16, marginBottom: 16 }}>
+              <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 12 }}>
+                <input type="text" placeholder="Buscar SKU, ASIN o producto..." value={search} onChange={function(e) { setSearch(e.target.value); }} style={Object.assign({}, inp, { flex: 1 })} />
+                <span style={{ fontSize: 12, color: "#334155", whiteSpace: "nowrap" }}><strong style={{ color: "#cbd5e1" }}>{sorted.length}</strong>{" / " + rows.length}</span>
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 20, alignItems: "center" }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", userSelect: "none" }}>
+                  <input type="checkbox" checked={hideNoCost} onChange={function(e) { setHideNoCost(e.target.checked); }} style={{ width: 16, height: 16, accentColor: "#1d4ed8", cursor: "pointer" }} />
+                  <span style={{ fontSize: 13, color: "#cbd5e1" }}>Ocultar sin coste</span>
+                </label>
+                <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", userSelect: "none" }}>
+                  <input type="checkbox" checked={hideNoSales} onChange={function(e) { setHideNoSales(e.target.checked); }} style={{ width: 16, height: 16, accentColor: "#1d4ed8", cursor: "pointer" }} />
+                  <span style={{ fontSize: 13, color: "#cbd5e1" }}>Ocultar sin ventas</span>
+                </label>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontSize: 13, color: "#94a3b8", whiteSpace: "nowrap" }}>Rendimiento objetivo:</span>
+                  <input type="number" min="1" max="99" step="1" value={targetMargin} onChange={function(e) { setTargetMargin(parseFloat(e.target.value) || 30); }} style={{ background: "#060e1f", border: "1px solid #1e3a5f", borderRadius: 8, padding: "5px 10px", color: "#fbbf24", fontSize: 14, fontWeight: 700, outline: "none", width: 60, textAlign: "center" }} />
+                  <span style={{ fontSize: 13, color: "#94a3b8" }}>% <span style={{ color: "#334155", fontSize: 11 }}>(PVPR)</span></span>
+                </div>
+                {Object.keys(colFilters).length > 0 && (
+                  <button onClick={function() { setColFilters({}); }} style={{ background: "#1d4ed8", color: "#fff", border: "none", borderRadius: 8, padding: "5px 12px", fontSize: 12, cursor: "pointer", fontWeight: 600 }}>
+                    {"Limpiar filtros (" + Object.keys(colFilters).length + ")"}
+                  </button>
+                )}
+              </div>
+
+            </div>
+
+            <div style={{ background: "#0d1829", border: "1px solid #1e2d4a", borderRadius: 14, overflowX: "auto", overflowY: "auto", maxHeight: "70vh" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                <thead>
+                  <tr>
+                    <th onClick={function() { doSort("sku"); }} style={{ padding: "10px 12px", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: ".05em", textAlign: "left", borderBottom: "1px solid #1e2d4a", color: sortC === "sku" ? "#60a5fa" : "#475569", whiteSpace: "nowrap", cursor: "pointer", background: "#0a1525", position: "sticky", left: 0, zIndex: 3 }}>
+                      {"SKU" + (sortC === "sku" ? (sortD === "asc" ? " \u2191" : " \u2193") : " \u2195")}
+                    </th>
+                    <SortTh label="ASIN"              col="asin"              sortBy={sortC} sortDir={sortD} onSort={doSort} left={true} />
+                    <SortTh label="Producto"           col="producto"          sortBy={sortC} sortDir={sortD} onSort={doSort} left={true} />
+                    <SortTh label={"Coste \u20ac"}     col="costeEUR"          sortBy={sortC} sortDir={sortD} onSort={doSort} />
+                    <SortTh label="Coste USD"          col="costeUSD"          sortBy={sortC} sortDir={sortD} onSort={doSort} />
+                    <th onClick={function() { doSort("pvp"); }} style={Object.assign({}, S.thR, { color: sortC === "pvp" ? "#60a5fa" : "#475569" })}>
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                        {"PVP" + (sortC === "pvp" ? (sortD === "asc" ? " \u2191" : " \u2193") : " \u2195")}
+                        <span
+                          title="Precio PVP medio de venta en Amazon"
+                          style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 15, height: 15, borderRadius: "50%", background: "#1e3a5f", color: "#60a5fa", fontSize: 9, fontWeight: 800, cursor: "help", flexShrink: 0, lineHeight: 1 }}
+                          onClick={function(e) { e.stopPropagation(); }}
+                        >?</span>
+                      </span>
+                    </th>
+                    <th onClick={function() { doSort("precioUnidad"); }} style={Object.assign({}, sortC === "precioUnidad" ? S.thR : S.thR, { color: sortC === "precioUnidad" ? "#60a5fa" : "#475569" })}>
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                        {"Neto" + (sortC === "precioUnidad" ? (sortD === "asc" ? " \u2191" : " \u2193") : " \u2195")}
+                        <span
+                          title="Importe recibido por unidad despues de descontar gastos de Amazon: Envios, Logistica, Almacenaje, Publicidad, Fuel, etc."
+                          style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 15, height: 15, borderRadius: "50%", background: "#1e3a5f", color: "#60a5fa", fontSize: 9, fontWeight: 800, cursor: "help", flexShrink: 0, lineHeight: 1 }}
+                          onClick={function(e) { e.stopPropagation(); }}
+                        >?</span>
+                      </span>
+                    </th>
+                    <SortTh label="Ventas"      col="unidadesVendidas"  sortBy={sortC} sortDir={sortD} onSort={doSort} />
+                    <SortTh label="Devolucion"         col="devolucion"        sortBy={sortC} sortDir={sortD} onSort={doSort} />
+                    <SortTh label="Ratio dev."         col="ratioDevoluciones" sortBy={sortC} sortDir={sortD} onSort={doSort} />
+                    <th onClick={function() { doSort("gastosFBA"); }} style={Object.assign({}, S.thR, { color: sortC === "gastosFBA" ? "#60a5fa" : "#475569" })}>
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                        {"Gastos FBA" + (sortC === "gastosFBA" ? (sortD === "asc" ? " \u2191" : " \u2193") : " \u2195")}
+                        <span
+                          title="El valor es la suma de las siguientes columnas: AZ: Tarifas de gestion logistica basicas de Logistica de Amazon (Por unidad) | AR: Recargo relacionado con combustible y logistica (Por unidad) | DY: Tarifas de ubicacion de envios a Amazon de Logistica de Amazon (Por unidad) | HS: Coste de almacenamiento (Por unidad)"
+                          style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 15, height: 15, borderRadius: "50%", background: "#1e3a5f", color: "#60a5fa", fontSize: 9, fontWeight: 800, cursor: "help", flexShrink: 0, lineHeight: 1 }}
+                          onClick={function(e) { e.stopPropagation(); }}
+                        >?</span>
+                      </span>
+                    </th>
+                    <th onClick={function() { doSort("comision"); }} style={Object.assign({}, S.thR, { color: sortC === "comision" ? "#60a5fa" : "#475569" })}>
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                        {"Comision" + (sortC === "comision" ? (sortD === "asc" ? " \u2191" : " \u2193") : " \u2195")}
+                        <span
+                          title="El valor es la suma de las siguientes columnas: FN: Tarifa por referencia (Por unidad) | HB: DSTR sobre las tarifas por referencia (Por unidad)"
+                          style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 15, height: 15, borderRadius: "50%", background: "#1e3a5f", color: "#60a5fa", fontSize: 9, fontWeight: 800, cursor: "help", flexShrink: 0, lineHeight: 1 }}
+                          onClick={function(e) { e.stopPropagation(); }}
+                        >?</span>
+                      </span>
+                    </th>
+                    <SortTh label="Publicidad"         col="publicidad"        sortBy={sortC} sortDir={sortD} onSort={doSort} />
+                    <SortTh label="ACoS"              col="acos"              sortBy={sortC} sortDir={sortD} onSort={doSort} />
+                    <SortTh label="Beneficio"         col="beneficio"         sortBy={sortC} sortDir={sortD} onSort={doSort} />
+                    <th onClick={function() { doSort("beneficioPct"); }} style={Object.assign({}, S.thR, { color: sortC === "beneficioPct" ? "#60a5fa" : "#475569" })}>
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                        {"Beneficio %" + (sortC === "beneficioPct" ? (sortD === "asc" ? " \u2191" : " \u2193") : " \u2195")}
+                        <span
+                          title="Beneficio % = (Beneficio / PVP) x 100"
+                          style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 15, height: 15, borderRadius: "50%", background: "#1e3a5f", color: "#60a5fa", fontSize: 9, fontWeight: 800, cursor: "help", flexShrink: 0, lineHeight: 1 }}
+                          onClick={function(e) { e.stopPropagation(); }}
+                        >?</span>
+                      </span>
+                    </th>
+                    <th onClick={function() { doSort("precioSugerido"); }} style={Object.assign({}, S.thR, { color: sortC === "precioSugerido" ? "#60a5fa" : "#475569" })}>
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                        {"PVPR" + (sortC === "precioSugerido" ? (sortD === "asc" ? " \u2191" : " \u2193") : " \u2195")}
+                        <span
+                          title={"PVPR = (Coste USD + Gastos FBA + Publicidad) / (1 - 15% - 30%) | 15% es la comision de Amazon | " + targetMargin + "% es el rendimiento objetivo"}
+                          style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 15, height: 15, borderRadius: "50%", background: "#1e3a5f", color: "#60a5fa", fontSize: 9, fontWeight: 800, cursor: "help", flexShrink: 0, lineHeight: 1 }}
+                          onClick={function(e) { e.stopPropagation(); }}
+                        >?</span>
+                      </span>
+                    </th>
+                    <SortTh label="+ 365 dias"     col="dias365"           sortBy={sortC} sortDir={sortD} onSort={doSort} />
+                    <th onClick={function() { doSort("ingresosNetos"); }} style={Object.assign({}, S.thR, { color: sortC === "ingresosNetos" ? "#60a5fa" : "#475569" })}>
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                        {"Total" + (sortC === "ingresosNetos" ? (sortD === "asc" ? " \u2191" : " \u2193") : " \u2195")}
+                        <span
+                          title="Suma de los ingresos netos por esta referencia"
+                          style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 15, height: 15, borderRadius: "50%", background: "#1e3a5f", color: "#60a5fa", fontSize: 9, fontWeight: 800, cursor: "help", flexShrink: 0, lineHeight: 1 }}
+                          onClick={function(e) { e.stopPropagation(); }}
+                        >?</span>
+                      </span>
+                    </th>
+                  </tr>
+                  <tr>
+                    {[
+                      { col: "sku",               ph: "Filtrar SKU...", sticky: true },
+                      { col: "asin",              ph: "Filtrar ASIN..."       },
+                      { col: "producto",           ph: "Filtrar producto..."   },
+                      { col: "costeEUR",           ph: "Min €"                },
+                      { col: "costeUSD",           ph: "Min $"                },
+                      { col: "pvp",               ph: "Min $"                },
+                      { col: "precioUnidad",       ph: "Neto min"             },
+                      { col: "unidadesVendidas",   ph: "Min"                  },
+                      { col: "devolucion",         ph: "Min"                  },
+                      { col: "ratioDevoluciones",  ph: "Ratio"                },
+                      { col: "gastosFBA",          ph: "Min $"                },
+                      { col: "comision",           ph: "Min $"                },
+                      { col: "publicidad",         ph: "Min $"                },
+                      { col: "acos",              ph: "ACoS"                 },
+                      { col: "beneficio",          ph: "Min"                  },
+                      { col: "beneficioPct",       ph: "Min %"                },
+                      { col: "precioSugerido",     ph: "Min $"                },
+                      { col: "dias365",            ph: "SI / No"              },
+                      { col: "ingresosNetos",      ph: "Min $"                },
+                    ].map(function(f, fi) {
+                      return (
+                        <td key={fi} style={{ padding: "4px 6px", background: "#060e1f", borderBottom: "1px solid #1e2d4a", position: f.sticky ? "sticky" : "static", left: f.sticky ? 0 : "auto", zIndex: f.sticky ? 2 : "auto" }}>
+                          {f.col && (
+                            <input
+                              type="text"
+                              placeholder={f.ph}
+                              value={colFilters[f.col] || ""}
+                              onChange={function(e) { var col = f.col; setColFilters(function(prev) { var nf = Object.assign({}, prev); if (e.target.value) nf[col] = e.target.value; else delete nf[col]; return nf; }); }}
+                              style={{ width: "100%", background: colFilters[f.col] ? "#0d2040" : "#0a1020", border: "1px solid " + (colFilters[f.col] ? "#3b82f6" : "#1e2d4a"), borderRadius: 6, padding: "3px 7px", color: "#e2e8f0", fontSize: 11, outline: "none" }}
+                            />
+                          )}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                </thead>
+                <tbody>
+                  {sorted.length === 0 && <tr><td colSpan={15} style={{ padding: 40, textAlign: "center", color: "#1e3a5f" }}>Sin resultados</td></tr>}
+                  {sorted.map(function(row, fi) {
+                    var i = rows.indexOf(row);                    return (
+                      <tr key={fi} style={{ background: fi % 2 === 0 ? "transparent" : "#060e1f" }}>
+                        <td style={Object.assign({}, S.tdL, { fontFamily: "monospace", color: "#94a3b8", maxWidth: 110, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", position: "sticky", left: 0, zIndex: 1, background: fi % 2 === 0 ? "#0d1829" : "#060e1f" })} title={row.sku || ""}>{row.sku || "-"}</td>
+                        <td style={Object.assign({}, S.tdL, { fontFamily: "monospace", color: "#64748b", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" })} title={row.asin || ""}>{row.asin || "-"}</td>
+                        <td style={Object.assign({}, S.tdL, { maxWidth: 200 })}>
+                          <div style={{ fontWeight: 600, color: row.hasTariff ? "#e2e8f0" : "#64748b", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={row.producto}>{row.producto || "-"}</div>
+                          {!row.hasTariff && <div style={{ fontSize: 11, color: "#fbbf24" }}>sin tarifa</div>}
+                        </td>
+                        <td style={S.tdR}><span style={{ color: row.costeEUR != null ? "#e2e8f0" : "#334155" }}>{fEUR(row.costeEUR)}</span></td>
+                        <td style={S.tdR}><span style={{ color: row.costeUSD != null ? "#e2e8f0" : "#334155" }}>{fUSD(row.costeUSD)}</span></td>
+                              <td style={Object.assign({}, S.tdR, { color: "#fbbf24", fontWeight: 600 })}>{fUSD(row.pvp)}</td>
+                  <td style={Object.assign({}, S.tdR, { color: "#fbbf24", fontWeight: 600 })}>{fUSD(row.precioUnidad)}</td>
+                        <td style={S.tdR}><strong style={{ color: "#cbd5e1" }}>{row.unidadesVendidas}</strong></td>
+                        <td style={Object.assign({}, S.tdR, { color: row.devolucion > 0 ? "#f87171" : "#334155" })}>{row.devolucion}</td>
+                        <td style={Object.assign({}, S.tdR, { color: row.ratioDevoluciones != null && row.ratioDevoluciones > 0.1 ? "#f87171" : "#94a3b8" })}>{fPct(row.ratioDevoluciones)}</td>
+                        <td style={Object.assign({}, S.tdR, { color: row.gastosFBA > 0 ? "#f87171" : "#334155" })}>{row.gastosFBA > 0 ? fUSD(row.gastosFBA) : "-"}</td>
+                        <td style={Object.assign({}, S.tdR, { color: row.comision != 0 ? "#f87171" : "#334155" })}>{row.comision !== 0 ? fUSD(row.comision) : "-"}</td>
+                        <td style={Object.assign({}, S.tdR, { color: row.publicidad <= 0 ? "#334155" : row.acos == null ? "#94a3b8" : row.acos < 0.10 ? "#4ade80" : row.acos <= 0.25 ? "#f97316" : "#f87171", fontWeight: row.publicidad > 0 ? 600 : 400 })}>{row.publicidad > 0 ? fUSD(row.publicidad) : "-"}</td>
+                        <td style={Object.assign({}, S.tdR, { color: row.acos == null ? "#334155" : row.acos < 0.10 ? "#4ade80" : row.acos <= 0.25 ? "#f97316" : "#f87171", fontWeight: row.acos != null ? 600 : 400 })}>{fPct(row.acos)}</td>
+                        <td style={Object.assign({}, S.tdR, { fontWeight: 700, color: row.beneficio == null ? "#334155" : row.beneficio >= 0 ? "#4ade80" : "#f87171" })}>{row.beneficio != null ? fUSD(row.beneficio) : "-"}</td>
+                        <td style={Object.assign({}, S.tdR, { fontWeight: 700, color: row.beneficioPct == null ? "#334155" : row.beneficioPct >= 0 ? "#4ade80" : "#f87171" })}>{row.beneficioPct != null ? n2(row.beneficioPct, 1) + "%" : "-"}</td>
+                        {(function() { var pvpr = calcPVPR(row); return <td style={Object.assign({}, S.tdR, { color: pvpr != null ? "#fbbf24" : "#334155", fontWeight: 600 })}>{pvpr != null ? fUSD(pvpr) : "-"}</td>; })()}
+                        <td style={Object.assign({}, S.tdC, { fontWeight: 700, color: row.dias365 === "SI" ? "#4ade80" : "#f87171" })}>{row.dias365}</td>
+                        <td style={Object.assign({}, S.tdR, { fontWeight: 700, color: row.ingresosNetos >= 0 ? "#4ade80" : "#f87171" })}>{fUSD(row.ingresosNetos)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+                {sorted.length > 0 && (
+                  <tfoot>
+                    <tr style={{ background: "#0a1525", borderTop: "2px solid #1e3a5f" }}>
+                      <td style={Object.assign({}, S.tdL, { fontWeight: 700, color: "#475569", fontSize: 11, textTransform: "uppercase", position: "sticky", left: 0, zIndex: 1, background: "#0a1525" })}>{"TOTAL (" + sorted.length + ")"}</td>
+                      <td style={S.tdL}></td><td style={S.tdL}></td><td style={S.tdR}></td><td style={S.tdR}></td><td style={S.tdR}></td><td style={S.tdR}></td>
+                      <td style={Object.assign({}, S.tdR, { fontWeight: 700, color: "#e2e8f0" })}>{sumF("unidadesVendidas").toLocaleString("es-ES")}</td>
+                      <td style={Object.assign({}, S.tdR, { color: "#f87171" })}>{sumF("devolucion")}</td>
+                      <td style={S.tdR}></td>
+                      <td style={Object.assign({}, S.tdR, { color: "#f87171", fontWeight: 700 })}>{fUSD(sorted.reduce(function(s,r) { return s + (r.gastosFBA || 0); }, 0))}</td>
+                      <td style={Object.assign({}, S.tdR, { color: "#f87171", fontWeight: 700 })}>{fUSD(sorted.reduce(function(s,r) { return s + (r.comision || 0); }, 0))}</td>
+                      <td style={Object.assign({}, S.tdR, { color: "#f87171", fontWeight: 700 })}>{fUSD(sumF("publicidad"))}</td>
+                      <td style={S.tdR}></td>
+                      {(function() { var t = sorted.reduce(function(s,r) { return s + (r.beneficio != null ? r.beneficio : 0); }, 0); return <td style={Object.assign({}, S.tdR, { fontWeight: 700, color: t >= 0 ? "#4ade80" : "#f87171" })}>{fUSD(t)}</td>; })()}
+                      {(function() { var valid = sorted.filter(function(r) { return r.beneficioPct != null; }); var avg = valid.length > 0 ? valid.reduce(function(s,r) { return s + r.beneficioPct; }, 0) / valid.length : null; return <td style={Object.assign({}, S.tdR, { fontWeight: 700, color: avg == null ? "#334155" : avg >= 0 ? "#4ade80" : "#f87171" })}>{avg != null ? n2(avg, 1) + "%" : "-"}</td>; })()}
+                      <td style={S.tdR}></td>
+                      <td style={S.tdR}></td>
+                      <td style={S.tdC}></td>
+                      <td style={Object.assign({}, S.tdR, { fontWeight: 700, color: "#4ade80" })}>{fUSD(sorted.reduce(function(s,r) { return s + (r.ingresosNetos || 0); }, 0))}</td>
+                    </tr>
+                  </tfoot>
+                )}
+              </table>
+            </div>
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
